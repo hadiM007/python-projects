@@ -1,0 +1,635 @@
+import sqlite3
+
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton
+)
+
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters
+)
+
+
+TOKEN = "8940557412:AAGNFLU7VIC5X6U1ZdQQ7sirz2xWb--MSco"
+
+DB_NAME = "shop.db"
+
+
+# -----------------------------
+# محصولات فروشگاه
+# -----------------------------
+
+products = {
+    "لپ‌تاپ": 35000000,
+    "گوشی": 15000000,
+    "هدفون": 2000000,
+    "تبلت": 12000000
+}
+
+
+# -----------------------------
+# سبد خرید مشتری‌ها
+# -----------------------------
+
+carts = {}
+
+
+# -----------------------------
+# ساخت دیتابیس و جدول‌ها
+# -----------------------------
+
+def init_db():
+
+    connection = sqlite3.connect(DB_NAME)
+
+    cursor = connection.cursor()
+
+    # جدول اصلی سفارش‌ها
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            order_id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            total INTEGER NOT NULL,
+            status TEXT NOT NULL
+        )
+    """)
+
+    # جدول محصولات هر سفارش
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS order_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            product_name TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            unit_price INTEGER NOT NULL,
+            FOREIGN KEY (order_id)
+                REFERENCES orders(order_id)
+        )
+    """)
+
+    connection.commit()
+    connection.close()
+
+
+# -----------------------------
+# منوی اصلی
+# -----------------------------
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    keyboard = [
+        ["🛍️ مشاهده محصولات"],
+        ["🛒 سبد خرید", "📦 سفارش‌های من"],
+        ["📞 ارتباط با پشتیبانی"]
+    ]
+
+    reply_markup = ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True
+    )
+
+    await update.message.reply_text(
+        "سلام! به فروشگاه من خوش اومدی! 🛍️\n\n"
+        "از منوی زیر یکی از گزینه‌ها رو انتخاب کن:",
+        reply_markup=reply_markup
+    )
+
+
+# -----------------------------
+# نمایش محصولات
+# -----------------------------
+
+async def show_products(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    for name, price in products.items():
+
+        keyboard = [[
+            InlineKeyboardButton(
+                "➕ افزودن به سبد خرید",
+                callback_data=f"add:{name}"
+            )
+        ]]
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        message = (
+            f"📦 محصول: {name}\n"
+            f"💰 قیمت: {price:,} تومان"
+        )
+
+        await update.message.reply_text(
+            message,
+            reply_markup=reply_markup
+        )
+
+
+# -----------------------------
+# افزودن محصول به سبد خرید
+# -----------------------------
+
+async def add_to_cart(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    product_name = query.data.split(":", 1)[1]
+
+    if product_name not in products:
+
+        await query.message.reply_text(
+            "❌ این محصول در فروشگاه موجود نیست."
+        )
+
+        return
+
+    user_id = query.from_user.id
+
+    if user_id not in carts:
+        carts[user_id] = {}
+
+    if product_name in carts[user_id]:
+        carts[user_id][product_name] += 1
+
+    else:
+        carts[user_id][product_name] = 1
+
+    await query.message.reply_text(
+        f"✅ {product_name} به سبد خریدت اضافه شد."
+    )
+
+
+# -----------------------------
+# محاسبه و نمایش سبد خرید
+# -----------------------------
+
+def make_cart_text(cart):
+
+    message = "🛒 سبد خرید شما:\n\n"
+
+    total = 0
+
+    for name, quantity in cart.items():
+
+        price = products[name]
+
+        subtotal = price * quantity
+
+        total += subtotal
+
+        message += (
+            f"📦 {name}\n"
+            f"تعداد: {quantity}\n"
+            f"مبلغ: {subtotal:,} تومان\n\n"
+        )
+
+    message += f"💰 مبلغ کل: {total:,} تومان"
+
+    return message, total
+
+
+async def show_cart(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user_id = update.effective_user.id
+
+    cart = carts.get(user_id, {})
+
+    if not cart:
+
+        await update.message.reply_text(
+            "🛒 سبد خریدت خالیه."
+        )
+
+        return
+
+    message, total = make_cart_text(cart)
+
+    keyboard = [[
+        InlineKeyboardButton(
+            "🧾 ثبت سفارش",
+            callback_data="checkout"
+        )
+    ]]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        message,
+        reply_markup=reply_markup
+    )
+
+
+# -----------------------------
+# ذخیره سفارش در SQLite
+# -----------------------------
+
+def save_order(user_id, cart):
+
+    connection = sqlite3.connect(DB_NAME)
+
+    cursor = connection.cursor()
+
+    try:
+
+        total = sum(
+            products[name] * quantity
+            for name, quantity in cart.items()
+        )
+
+        cursor.execute(
+            "SELECT MAX(order_id) FROM orders"
+        )
+
+        result = cursor.fetchone()[0]
+
+        if result is None:
+            order_id = 1001
+
+        else:
+            order_id = result + 1
+
+        # ذخیره اطلاعات اصلی سفارش
+        cursor.execute(
+            """
+            INSERT INTO orders (
+                order_id,
+                user_id,
+                total,
+                status
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                order_id,
+                user_id,
+                total,
+                "در انتظار پرداخت"
+            )
+        )
+
+        # ذخیره محصولات سفارش
+        for name, quantity in cart.items():
+
+            cursor.execute(
+                """
+                INSERT INTO order_items (
+                    order_id,
+                    product_name,
+                    quantity,
+                    unit_price
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    order_id,
+                    name,
+                    quantity,
+                    products[name]
+                )
+            )
+
+        connection.commit()
+
+        return order_id, total
+
+    except Exception:
+
+        connection.rollback()
+
+        raise
+
+    finally:
+
+        connection.close()
+
+
+# -----------------------------
+# ثبت سفارش و صدور فاکتور
+# -----------------------------
+
+async def checkout(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    cart = carts.get(user_id, {})
+
+    if not cart:
+
+        await query.message.reply_text(
+            "🛒 سبد خریدت خالیه."
+        )
+
+        return
+
+    try:
+
+        order_id, total = save_order(
+            user_id,
+            cart.copy()
+        )
+
+    except Exception as error:
+
+        print("Database error:", error)
+
+        await query.message.reply_text(
+            "❌ ثبت سفارش با مشکل مواجه شد. "
+            "لطفاً دوباره تلاش کن."
+        )
+
+        return
+
+    # فقط پس از ذخیره موفق، سبد پاک می‌شود
+    carts[user_id] = {}
+
+    invoice = (
+        f"🧾 فاکتور سفارش\n\n"
+        f"🔢 شماره سفارش: {order_id}\n\n"
+    )
+
+    for name, quantity in cart.items():
+
+        subtotal = products[name] * quantity
+
+        invoice += (
+            f"📦 {name}\n"
+            f"تعداد: {quantity}\n"
+            f"مبلغ: {subtotal:,} تومان\n\n"
+        )
+
+    invoice += (
+        f"💰 مبلغ کل: {total:,} تومان\n"
+        f"📌 وضعیت: در انتظار پرداخت\n\n"
+        f"اطلاعات سفارش ذخیره شد."
+    )
+
+    keyboard = [[
+        InlineKeyboardButton(
+            "💳 پرداخت سفارش",
+            callback_data=f"pay:{order_id}"
+        )
+    ]]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.message.reply_text(
+        invoice,
+        reply_markup=reply_markup
+    )
+
+
+# -----------------------------
+# نمایش سفارش‌های ثبت‌شده
+# -----------------------------
+
+async def show_orders(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user_id = update.effective_user.id
+
+    connection = sqlite3.connect(DB_NAME)
+
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT order_id, total, status
+        FROM orders
+        WHERE user_id = ?
+        ORDER BY order_id DESC
+        """,
+        (user_id,)
+    )
+
+    user_orders = cursor.fetchall()
+
+    if not user_orders:
+
+        connection.close()
+
+        await update.message.reply_text(
+            "📦 هنوز سفارشی ثبت نکردی."
+        )
+
+        return
+
+    for order_id, total, status in user_orders:
+
+        cursor.execute(
+            """
+            SELECT product_name, quantity, unit_price
+            FROM order_items
+            WHERE order_id = ?
+            """,
+            (order_id,)
+        )
+
+        items = cursor.fetchall()
+
+        message = (
+            f"📦 سفارش شماره: {order_id}\n"
+            f"💰 مبلغ کل: {total:,} تومان\n"
+            f"📌 وضعیت: {status}\n\n"
+            f"محصولات سفارش:\n"
+        )
+
+        for name, quantity, unit_price in items:
+
+            subtotal = quantity * unit_price
+
+            message += (
+                f"• {name}\n"
+                f"  تعداد: {quantity}\n"
+                f"  مبلغ: {subtotal:,} تومان\n"
+            )
+
+        keyboard = []
+
+        if status == "در انتظار پرداخت":
+
+            keyboard.append([
+                InlineKeyboardButton(
+                    "💳 پرداخت سفارش",
+                    callback_data=f"pay:{order_id}"
+                )
+            ])
+
+        reply_markup = (
+            InlineKeyboardMarkup(keyboard)
+            if keyboard else None
+        )
+
+        await update.message.reply_text(
+            message,
+            reply_markup=reply_markup
+        )
+
+    connection.close()
+
+
+# -----------------------------
+# دکمه پرداخت
+# -----------------------------
+
+async def pay_order(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    order_id = int(
+        query.data.split(":", 1)[1]
+    )
+
+    user_id = query.from_user.id
+
+    connection = sqlite3.connect(DB_NAME)
+
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT total, status
+        FROM orders
+        WHERE order_id = ? AND user_id = ?
+        """,
+        (order_id, user_id)
+    )
+
+    order = cursor.fetchone()
+
+    connection.close()
+
+    if order is None:
+
+        await query.message.reply_text(
+            "❌ سفارش موردنظر پیدا نشد."
+        )
+
+        return
+
+    total, status = order
+
+    if status != "در انتظار پرداخت":
+
+        await query.message.reply_text(
+            f"وضعیت این سفارش: {status}"
+        )
+
+        return
+
+    await query.message.reply_text(
+        f"💳 سفارش شماره {order_id}\n"
+        f"مبلغ قابل پرداخت: {total:,} تومان\n\n"
+        f"درگاه پرداخت هنوز متصل نشده است.\n"
+        f"در مرحله بعد درگاه معتبر ایرانی را متصل می‌کنیم."
+    )
+
+
+# -----------------------------
+# مدیریت منوی اصلی
+# -----------------------------
+
+async def handle_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    text = update.message.text
+
+    if text == "🛍️ مشاهده محصولات":
+
+        await show_products(update, context)
+
+    elif text == "🛒 سبد خرید":
+
+        await show_cart(update, context)
+
+    elif text == "📦 سفارش‌های من":
+
+        await show_orders(update, context)
+
+    elif text == "📞 ارتباط با پشتیبانی":
+
+        await update.message.reply_text(
+            "📞 برای ارتباط با پشتیبانی، "
+            "فعلاً از همین چت پیام بفرست."
+        )
+
+
+# -----------------------------
+# راه‌اندازی ربات
+# -----------------------------
+
+init_db()
+
+app = Application.builder().token(TOKEN).build()
+
+app.add_handler(
+    CommandHandler("start", start)
+)
+
+app.add_handler(
+    CommandHandler("products", show_products)
+)
+
+app.add_handler(
+    CallbackQueryHandler(
+        add_to_cart,
+        pattern=r"^add:"
+    )
+)
+
+app.add_handler(
+    CallbackQueryHandler(
+        checkout,
+        pattern=r"^checkout$"
+    )
+)
+
+app.add_handler(
+    CallbackQueryHandler(
+        pay_order,
+        pattern=r"^pay:"
+    )
+)
+
+app.add_handler(
+    MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_menu
+    )
+)
+
+app.run_polling()
