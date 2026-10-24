@@ -17,7 +17,7 @@ from telegram.ext import (
 )
 
 
-TOKEN = "8940557412:AAGNFLU7VIC5X6U1ZdQQ7sirz2xWb--MSco"
+TOKEN = 
 
 DB_NAME = "shop.db"
 
